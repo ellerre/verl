@@ -17,7 +17,12 @@
 import pytest
 import torch
 
-from verl.checkpoint_engine.nccl_m2n_checkpoint_engine import NCCLM2NLocalWeight, _fusion_groups, _stack_weight
+from verl.checkpoint_engine.nccl_m2n_checkpoint_engine import (
+    NCCLM2NCheckpointEngine,
+    NCCLM2NLocalWeight,
+    _fusion_groups,
+    _stack_weight,
+)
 from verl.checkpoint_engine.reshard_layout import build_reshard_layouts
 from verl.models.transformers.hf_dense_decoder_tp import infer_dense_decoder_tp_shard_dim
 
@@ -150,3 +155,18 @@ def test_stacked_layout_keeps_every_member_placement(name, destination):
         together = torch.stack(full)
         together = together if dim is None else together.chunk(shards, dim=dim + 1)[rank]
         assert torch.equal(together, torch.stack(alone))
+
+
+def test_fuse_cap_is_independent_of_the_bucket_size():
+    topology = dict(source_dp=1, source_shard_size=SOURCE_SHARDS, destination_dp=2, destination_shard_size=2)
+    default = NCCLM2NCheckpointEngine(bucket_size=2048 << 20, fuse=True, **topology)
+    capped = NCCLM2NCheckpointEngine(bucket_size=2048 << 20, fuse=True, fuse_megabytes=64, **topology)
+    try:
+        assert default.fuse_bytes == 2048 << 20
+        assert capped.fuse_bytes == 64 << 20
+        assert capped.bucket_size == 2048 << 20
+        with pytest.raises(ValueError):
+            NCCLM2NCheckpointEngine(bucket_size=2048 << 20, fuse=True, fuse_megabytes=0, **topology)
+    finally:
+        default.close()
+        capped.close()

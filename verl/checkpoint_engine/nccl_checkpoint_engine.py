@@ -130,6 +130,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         multi_sender (bool): Whether to also admit the source's NVLink-local actor workers into the
             broadcast group as relays, widening the fan-out at the root. Defaults to False, which
             keeps the group at one sender (actor rank 0) plus the rollout workers.
+        cast_to_rollout_dtype (bool): Cast floating-point weights to ``rollout_dtype`` before they
+            enter the buckets, so an fp32 trainer broadcasts half the bytes. Defaults to False,
+            which sends weights in the dtype the trainer exports.
     """
 
     def __init__(
@@ -140,12 +143,14 @@ class NCCLCheckpointEngine(CheckpointEngine):
         is_master: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
         multi_sender: bool = True,
+        cast_to_rollout_dtype: bool = False,
     ) -> None:
         self.bucket_size = bucket_size
         self.group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
         self.multi_sender = multi_sender
+        self.cast_to_rollout_dtype = cast_to_rollout_dtype
 
         # start zeromq server for broadcasting bucket tensor metadata
         self.is_master = is_master
@@ -323,6 +328,14 @@ class NCCLCheckpointEngine(CheckpointEngine):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         assert self.rank < self.num_senders, "Rollout workers should not send weights."
+
+        # Every sender casts, relays included: they derive bucket boundaries from their own
+        # copy of the stream and must size it exactly as rank 0 does.
+        if self.cast_to_rollout_dtype:
+            weights = (
+                (name, weight.to(self.rollout_dtype) if weight.is_floating_point() else weight)
+                for name, weight in weights
+            )
 
         # Actor workers left out of the group still have to walk the generator: producing each
         # weight is itself collective over the actor group.

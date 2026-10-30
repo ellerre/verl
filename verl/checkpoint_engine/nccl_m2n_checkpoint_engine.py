@@ -217,9 +217,10 @@ class _NCCLM2NChannel(CheckpointEngine):
 
     Args:
         bucket_size: Common checkpoint-engine bucket size in bytes. NCCL M2N
-            manages its staging pool internally. With ``fuse`` this caps the
-            source tensors held while grouping; otherwise it is retained only for
-            checkpoint-engine interface compatibility.
+            manages its staging pool internally. With ``fuse`` and no
+            ``fuse_megabytes`` it caps the source tensors held while grouping;
+            otherwise it is retained only for checkpoint-engine interface
+            compatibility.
         is_master: Whether this source rank creates the NCCL unique ID and publishes
             per-weight metadata. Exactly one source rank must be the master.
         source_dp: Number of replicated groups in the source mesh.
@@ -230,6 +231,9 @@ class _NCCLM2NChannel(CheckpointEngine):
         fuse: Stack weights of one layout family and send each stack with a
             single reshard instead of one reshard per weight. Applies to the
             windowless path; receivers follow the sender's metadata either way.
+        fuse_megabytes: Cap, in MiB, on the source tensors held while grouping.
+            Separate from ``bucket_size``, which the rollout side also uses to
+            size its CUDA-IPC bucket into vLLM. Defaults to ``bucket_size``.
     """
 
     wire_format = "rank_local_named_tensors"
@@ -245,6 +249,7 @@ class _NCCLM2NChannel(CheckpointEngine):
         destination_dp: int | None = None,
         destination_shard_size: int | None = None,
         fuse: bool = False,
+        fuse_megabytes: int | None = None,
     ) -> None:
         topology = {
             "source_dp": source_dp,
@@ -259,6 +264,9 @@ class _NCCLM2NChannel(CheckpointEngine):
         self.bucket_size = int(bucket_size)
         self.is_master = bool(is_master)
         self.fuse = bool(fuse)
+        self.fuse_bytes = self.bucket_size if fuse_megabytes is None else int(fuse_megabytes) << 20
+        if self.fuse_bytes <= 0:
+            raise ValueError("NCCL M2N fuse_megabytes must be positive")
         self.source_dp = int(source_dp)
         self.source_shard_size = int(source_shard_size)
         self.destination_dp = int(destination_dp)
@@ -774,7 +782,7 @@ class _NCCLM2NChannel(CheckpointEngine):
             raise RuntimeError("NCCL M2N transfer stream is not initialized")
         weights = (self._checked_weight(exported) for exported in weights)
         if self.fuse and self._window is None:
-            for group in _fusion_groups(weights, self.bucket_size):
+            for group in _fusion_groups(weights, self.fuse_bytes):
                 if len(group) == 1:
                     self._send_weight(group[0], caller_stream, stream)
                 else:
