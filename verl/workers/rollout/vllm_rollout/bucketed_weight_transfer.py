@@ -20,6 +20,7 @@ Not recommended depending on vllm for this file.
 import gc
 import logging
 import os
+import uuid
 from multiprocessing import shared_memory
 from typing import Callable, TypedDict
 
@@ -31,6 +32,17 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device, 
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# Opt-in for disaggregated rollouts, where nothing else needs the bucket between
+# updates: keep the CUDA-IPC bucket, and the receiver's mapping of it, for the
+# whole run instead of allocating, sharing and freeing them (with a full
+# gc.collect()) on every update. Colocated training needs the memory back after
+# each update, hence the default.
+PERSISTENT_BUCKET = os.environ.get("VERL_PERSISTENT_IPC_BUCKET", "0") == "1"
+# Sender: (device index, bucket bytes) -> [bucket id, buffer, handle already shared]
+_sender_buckets: dict[tuple[int, int], list] = {}
+# Receiver: bucket id -> mapped buffer
+_receiver_buckets: dict[str, torch.Tensor] = {}
 
 
 class TensorMetadata(TypedDict):
@@ -99,6 +111,7 @@ class BucketedWeightSender:
         self.socket = None
         self.buffer = None
         self.shm = None
+        self._sent_directly = False
 
     async def async_send_weights(self, weights):
         """
@@ -174,13 +187,22 @@ class BucketedWeightSender:
     def _init_buffer(self):
         """build communication buffer"""
         buffer, shm = None, None
-        if not self.use_shm:
+        if not self.use_shm and PERSISTENT_BUCKET:
+            key = (get_device_id(), self.bucket_size)
+            entry = _sender_buckets.get(key)
+            if entry is None:
+                device = f"{get_device_name()}:{get_device_id()}"
+                buffer = torch.empty(self.bucket_size, dtype=torch.uint8, device=device)
+                entry = _sender_buckets[key] = [uuid.uuid4().hex, buffer, False]
+            bucket_id, buffer, shared = entry
+            # The receiver maps the bucket once; later updates only name it.
+            self.socket.send_pyobj({"bucket_id": bucket_id, "handle": None if shared else reduce_tensor(buffer)})
+            entry[2] = True
+        elif not self.use_shm:
             buffer = torch.empty(self.bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:{get_device_id()}")
             handle = reduce_tensor(buffer)
             self.socket.send_pyobj(handle)
         else:
-            import uuid
-
             # Create unique name for shared memory
             shm_name = f"verl_weights_{uuid.uuid4().hex}"
             shm = create_shared_memory(self.bucket_size, shm_name)
@@ -204,6 +226,14 @@ class BucketedWeightSender:
                 os.remove(ipc_path)
             except OSError:
                 pass
+        if PERSISTENT_BUCKET and not self.use_shm:
+            # The bucket stays for the next update; only weights shared by their
+            # own handle (larger than the bucket) need releasing.
+            self.buffer = None
+            if self._sent_directly:
+                gc.collect()
+                get_torch_device().ipc_collect()
+            return
         del self.buffer
         self.buffer = None
         if self.shm is not None:
@@ -219,6 +249,7 @@ class BucketedWeightSender:
     def _direct_send_large_weight(self, name: str, weight: torch.Tensor):
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
         logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
+        self._sent_directly = True
         # TODO: support fallback to shared memory
         handle = reduce_tensor(weight)
         bucket_meta: dict[str, TensorMetadata] = {}
@@ -260,6 +291,7 @@ class BucketedWeightReceiver:
         self.socket = None
         self.buffer = None
         self.shm = None
+        self._persistent = False
 
     def receive_weights(self, on_bucket_received: callable):
         """
@@ -310,7 +342,14 @@ class BucketedWeightReceiver:
         """Receive and rebuild communication buffer from sender."""
         comm_metadata = self.socket.recv_pyobj()
         buffer, shm = None, None
-        if not self.use_shm:
+        if isinstance(comm_metadata, dict) and "bucket_id" in comm_metadata:
+            # A persistent bucket (VERL_PERSISTENT_IPC_BUCKET on the sender).
+            bucket_id, handle = comm_metadata["bucket_id"], comm_metadata["handle"]
+            if handle is not None:
+                _receiver_buckets[bucket_id] = rebuild_ipc(handle, self.device.index)
+            buffer = _receiver_buckets[bucket_id]
+            self._persistent = True
+        elif not self.use_shm:
             handle = comm_metadata
             buffer = rebuild_ipc(handle, self.device.index)
             assert buffer.dtype == torch.uint8
@@ -330,6 +369,9 @@ class BucketedWeightReceiver:
         # Synchronize before releasing the buffer to ensure all async ops
         # referencing it (e.g. clone, .to()) have completed.
         get_torch_device().synchronize()
+        if self._persistent:
+            self.buffer = None
+            return
         del self.buffer
         self.buffer = None
         if self.shm is not None:
