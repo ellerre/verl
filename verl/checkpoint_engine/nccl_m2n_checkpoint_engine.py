@@ -22,7 +22,7 @@ import math
 import os
 import socket
 from dataclasses import dataclass, replace
-from typing import Any, AsyncGenerator, Generator
+from typing import Any, AsyncGenerator, Generator, Iterable, Iterator
 
 import ray
 import torch
@@ -144,6 +144,69 @@ def _allocate_destination(shape: torch.Size, dtype: torch.dtype) -> torch.Tensor
     return torch.empty(shape, dtype=dtype, device=device)
 
 
+def _fusion_key(weight: NCCLM2NLocalWeight) -> tuple | None:
+    """Return the layout family of a weight, or ``None`` if it must travel alone.
+
+    Weights of one family can be stacked on a new leading dimension that is
+    replicated on both sides, so one reshard carries all of them. M2N accepts at
+    most three tensor dimensions, which leaves room for the stack only below that.
+    """
+
+    if weight.expert_ids is not None or len(weight.global_shape) >= 3:
+        return None
+    return (
+        weight.tensor.dtype,
+        tuple(weight.global_shape),
+        weight.source_shard_dim,
+        weight.destination_shard_dim,
+        weight.source_shard_size,
+        weight.source_mesh_dims,
+    )
+
+
+def _fusion_groups(weights: Iterable[NCCLM2NLocalWeight], cap_bytes: int) -> Iterator[list[NCCLM2NLocalWeight]]:
+    """Group a weight stream into layout families, holding at most ``cap_bytes`` of tensors.
+
+    When the next weight would exceed the cap, every family collected so far is
+    emitted in order of first appearance and collection restarts; a weight larger
+    than the cap is emitted alone. Every source rank sees the same export order
+    and shapes, so every rank forms the same groups. Callers may clear an emitted
+    list once its tensors are no longer needed.
+    """
+
+    pending: dict[tuple, list[NCCLM2NLocalWeight]] = {}
+    held = 0
+    for index, weight in enumerate(weights):
+        size = weight.tensor.numel() * weight.tensor.element_size()
+        if pending and held + size > cap_bytes:
+            yield from pending.values()
+            pending, held = {}, 0
+        key = _fusion_key(weight)
+        pending.setdefault(("alone", index) if key is None else key, []).append(weight)
+        held += size
+    yield from pending.values()
+
+
+def _stack_weight(member: NCCLM2NLocalWeight, tensor: torch.Tensor, count: int) -> NCCLM2NLocalWeight:
+    """Describe ``count`` weights of ``member``'s family stacked on a new leading dimension.
+
+    The new dimension is replicated on both sides, so every sharded tensor
+    dimension moves up by one and each stacked weight keeps exactly the
+    placement it would have had alone.
+    """
+
+    def shifted(dim: int | None) -> int | None:
+        return None if dim is None else dim + 1
+
+    return replace(
+        member,
+        tensor=tensor,
+        global_shape=torch.Size((count, *member.global_shape)),
+        source_shard_dim=shifted(member.source_shard_dim),
+        destination_shard_dim=shifted(member.destination_shard_dim),
+    )
+
+
 class _NCCLM2NChannel(CheckpointEngine):
     """Transfer source shards directly into destination rank-local shards.
 
@@ -154,8 +217,9 @@ class _NCCLM2NChannel(CheckpointEngine):
 
     Args:
         bucket_size: Common checkpoint-engine bucket size in bytes. NCCL M2N
-            manages its staging pool internally, so this value is retained only
-            for checkpoint-engine interface compatibility.
+            manages its staging pool internally. With ``fuse`` this caps the
+            source tensors held while grouping; otherwise it is retained only for
+            checkpoint-engine interface compatibility.
         is_master: Whether this source rank creates the NCCL unique ID and publishes
             per-weight metadata. Exactly one source rank must be the master.
         source_dp: Number of replicated groups in the source mesh.
@@ -163,6 +227,9 @@ class _NCCLM2NChannel(CheckpointEngine):
         destination_dp: Number of replicated groups in the destination mesh.
         destination_shard_size: Number of ranks in the destination mesh's generic
             sharded dimension. A consumer such as vLLM may interpret this as TP.
+        fuse: Stack weights of one layout family and send each stack with a
+            single reshard instead of one reshard per weight. Applies to the
+            windowless path; receivers follow the sender's metadata either way.
     """
 
     wire_format = "rank_local_named_tensors"
@@ -177,6 +244,7 @@ class _NCCLM2NChannel(CheckpointEngine):
         source_shard_size: int | None = None,
         destination_dp: int | None = None,
         destination_shard_size: int | None = None,
+        fuse: bool = False,
     ) -> None:
         topology = {
             "source_dp": source_dp,
@@ -190,6 +258,7 @@ class _NCCLM2NChannel(CheckpointEngine):
 
         self.bucket_size = int(bucket_size)
         self.is_master = bool(is_master)
+        self.fuse = bool(fuse)
         self.source_dp = int(source_dp)
         self.source_shard_size = int(source_shard_size)
         self.destination_dp = int(destination_dp)
@@ -576,6 +645,108 @@ class _NCCLM2NChannel(CheckpointEngine):
             raise RuntimeError("received an unexpected NCCL M2N metadata topic")
         return self._socket.recv_pyobj()
 
+    def _checked_weight(self, exported: Any) -> NCCLM2NLocalWeight:
+        weight = self._coerce_weight(exported)
+        self._validate_owner(weight)
+        return weight
+
+    @staticmethod
+    def _weight_metadata(weight: NCCLM2NLocalWeight) -> dict[str, Any]:
+        """Describe a weight's layout for the receivers; a group sends its first member's."""
+
+        return {
+            "global_shape": tuple(weight.global_shape),
+            "dtype": weight.tensor.dtype,
+            "destination_shard_dim": weight.destination_shard_dim,
+            "source_shard_dim": weight.source_shard_dim,
+            "source_shard_rank": weight.source_shard_rank,
+            "source_shard_size": weight.source_shard_size,
+            "local_shape": tuple(weight.tensor.shape),
+            "expert_ids": weight.expert_ids,
+        }
+
+    def _weight_from_metadata(self, metadata: dict[str, Any], name: str) -> NCCLM2NLocalWeight:
+        local_shape = metadata.get("local_shape", metadata["global_shape"])
+        return NCCLM2NLocalWeight(
+            name=name,
+            tensor=torch.empty(local_shape, dtype=metadata["dtype"], device="meta"),
+            global_shape=torch.Size(metadata["global_shape"]),
+            destination_shard_dim=metadata["destination_shard_dim"],
+            source_shard_dim=metadata["source_shard_dim"],
+            source_shard_size=int(metadata["source_shard_size"]),
+            source_shard_rank=int(metadata.get("source_shard_rank", 0)),
+            expert_ids=metadata.get("expert_ids"),
+        )
+
+    def _send_weight(self, weight: NCCLM2NLocalWeight, caller_stream: Any, stream: Any) -> None:
+        """Reshard one weight."""
+
+        stream.wait_stream(caller_stream)
+        packed = self._packed(weight)
+        source = weight.tensor
+        if self._window_tensor is not None:
+            source_layout, _ = self._layouts(weight)
+            source = _window_view(
+                self._window_tensor,
+                source_layout.local_shape,
+                torch.uint8 if packed else weight.tensor.dtype,
+            )
+            with torch.cuda.stream(stream):
+                if packed:
+                    payload, stride, source_rows, _ = self._wire_geometry(weight)
+                    rows = source.view(source_rows, stride)
+                    rows[:, :payload].copy_(
+                        weight.tensor.contiguous().view(torch.uint8).reshape(source_rows, payload)
+                    )
+                    rows[:, payload:].zero_()
+                else:
+                    source.copy_(weight.tensor, non_blocking=True)
+            if weight.tensor.is_cuda:
+                weight.tensor.record_stream(stream)
+        if self.rank == 0:
+            self._publish({"kind": "weight", "name": weight.name, **self._weight_metadata(weight)})
+        source_desc, destination_desc = self._descriptors(weight, source, None)
+        if self._window is None:
+            # The simple PP1/EP1 path retains the direct API and lets M2N own
+            # any internal staging needed by Handle.reshard().
+            self._handle.reshard(
+                self._comm,
+                source_desc,
+                destination_desc,
+                stream=_nccl_stream(stream),
+            )
+            caller_stream.wait_stream(stream)
+        else:
+            self._handle.reshard_with_window(
+                self._comm,
+                self._window,
+                source_desc,
+                destination_desc,
+                stream=_nccl_stream(stream),
+            )
+            # One byte window is reused for all families in this channel.
+            stream.synchronize()
+
+    def _send_group(self, members: list[NCCLM2NLocalWeight], caller_stream: Any, stream: Any) -> None:
+        """Stack one layout family into a single source tensor and reshard it in one call."""
+
+        # One device copy on the caller stream; the stack lives until the
+        # caller stream, which waits on the transfer below, reuses its memory.
+        weight = _stack_weight(members[0], torch.stack([member.tensor for member in members]), len(members))
+        stream.wait_stream(caller_stream)
+        if self.rank == 0:
+            self._publish(
+                {"kind": "group", "names": [member.name for member in members], **self._weight_metadata(members[0])}
+            )
+        source_desc, destination_desc = self._descriptors(weight, weight.tensor, None)
+        self._handle.reshard(
+            self._comm,
+            source_desc,
+            destination_desc,
+            stream=_nccl_stream(stream),
+        )
+        caller_stream.wait_stream(stream)
+
     @torch.no_grad()
     async def send_weights(self, weights: Generator, global_steps: int | None = None) -> dict:
         """Reshard local source tensors into destination rank-local tensors.
@@ -601,67 +772,18 @@ class _NCCLM2NChannel(CheckpointEngine):
         stream = self._transfer_stream
         if stream is None:
             raise RuntimeError("NCCL M2N transfer stream is not initialized")
-        for exported in weights:
-            weight = self._coerce_weight(exported)
-            self._validate_owner(weight)
-            stream.wait_stream(caller_stream)
-            packed = self._packed(weight)
-            source = weight.tensor
-            if self._window_tensor is not None:
-                source_layout, _ = self._layouts(weight)
-                source = _window_view(
-                    self._window_tensor,
-                    source_layout.local_shape,
-                    torch.uint8 if packed else weight.tensor.dtype,
-                )
-                with torch.cuda.stream(stream):
-                    if packed:
-                        payload, stride, source_rows, _ = self._wire_geometry(weight)
-                        rows = source.view(source_rows, stride)
-                        rows[:, :payload].copy_(
-                            weight.tensor.contiguous().view(torch.uint8).reshape(source_rows, payload)
-                        )
-                        rows[:, payload:].zero_()
-                    else:
-                        source.copy_(weight.tensor, non_blocking=True)
-                if weight.tensor.is_cuda:
-                    weight.tensor.record_stream(stream)
-            if self.rank == 0:
-                self._publish(
-                    {
-                        "kind": "weight",
-                        "name": weight.name,
-                        "global_shape": tuple(weight.global_shape),
-                        "dtype": weight.tensor.dtype,
-                        "destination_shard_dim": weight.destination_shard_dim,
-                        "source_shard_dim": weight.source_shard_dim,
-                        "source_shard_rank": weight.source_shard_rank,
-                        "source_shard_size": weight.source_shard_size,
-                        "local_shape": tuple(weight.tensor.shape),
-                        "expert_ids": weight.expert_ids,
-                    }
-                )
-            source_desc, destination_desc = self._descriptors(weight, source, None)
-            if self._window is None:
-                # The simple PP1/EP1 path retains the direct API and lets M2N own
-                # any internal staging needed by Handle.reshard().
-                self._handle.reshard(
-                    self._comm,
-                    source_desc,
-                    destination_desc,
-                    stream=_nccl_stream(stream),
-                )
-                caller_stream.wait_stream(stream)
-            else:
-                self._handle.reshard_with_window(
-                    self._comm,
-                    self._window,
-                    source_desc,
-                    destination_desc,
-                    stream=_nccl_stream(stream),
-                )
-                # One byte window is reused for all families in this channel.
-                stream.synchronize()
+        weights = (self._checked_weight(exported) for exported in weights)
+        if self.fuse and self._window is None:
+            for group in _fusion_groups(weights, self.bucket_size):
+                if len(group) == 1:
+                    self._send_weight(group[0], caller_stream, stream)
+                else:
+                    self._send_group(group, caller_stream, stream)
+                # Only the stack, or the lone weight, is still needed.
+                group.clear()
+        else:
+            for weight in weights:
+                self._send_weight(weight, caller_stream, stream)
         if self.rank == 0:
             self._publish({"kind": "end"})
         # finalize() fences every matching asynchronous M2N operation. The
@@ -677,7 +799,9 @@ class _NCCLM2NChannel(CheckpointEngine):
                 for checkpoint-engine interface compatibility.
 
         Yields:
-            The parameter name and its newly allocated destination rank-local tensor.
+            The parameter name and its newly allocated destination rank-local
+            tensor. Weights the sender fused arrive as views into one allocation
+            per group, which is freed once the consumer drops every view.
         """
 
         del global_steps
@@ -692,22 +816,36 @@ class _NCCLM2NChannel(CheckpointEngine):
             raise RuntimeError("NCCL M2N transfer stream is not initialized")
         while True:
             metadata = self._receive()
-            if metadata.get("kind") == "end":
+            kind = metadata.get("kind")
+            if kind == "end":
                 break
-            if metadata.get("kind") != "weight":
+            if kind == "group":
+                if self._window_tensor is not None:
+                    raise RuntimeError("fused NCCL M2N groups require the windowless path")
+                names = metadata["names"]
+                member = self._weight_from_metadata(metadata, names[0])
+                shape = (len(names), *member.tensor.shape)
+                weight = _stack_weight(member, torch.empty(shape, dtype=member.tensor.dtype, device="meta"), len(names))
+                _, destination_layout = self._layouts(weight)
+                destination = _allocate_destination(destination_layout.local_shape, weight.tensor.dtype)
+                source_desc, destination_desc = self._descriptors(weight, None, destination)
+                stream.wait_stream(caller_stream)
+                self._handle.reshard(
+                    self._comm,
+                    source_desc,
+                    destination_desc,
+                    stream=_nccl_stream(stream),
+                )
+                caller_stream.wait_stream(stream)
+                for name, tensor in zip(names, destination, strict=True):
+                    yield name, tensor
+                # Drop this generator's references before the next group is allocated.
+                del destination, tensor
+                continue
+            if kind != "weight":
                 raise RuntimeError(f"invalid NCCL M2N metadata: {metadata!r}")
 
-            local_shape = metadata.get("local_shape", metadata["global_shape"])
-            weight = NCCLM2NLocalWeight(
-                name=metadata["name"],
-                tensor=torch.empty(local_shape, dtype=metadata["dtype"], device="meta"),
-                global_shape=torch.Size(metadata["global_shape"]),
-                destination_shard_dim=metadata["destination_shard_dim"],
-                source_shard_dim=metadata["source_shard_dim"],
-                source_shard_size=int(metadata["source_shard_size"]),
-                source_shard_rank=int(metadata.get("source_shard_rank", 0)),
-                expert_ids=metadata.get("expert_ids"),
-            )
+            weight = self._weight_from_metadata(metadata, metadata["name"])
             _, destination_layout = self._layouts(weight)
             packed = self._packed(weight)
             destination = (
