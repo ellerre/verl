@@ -118,6 +118,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._init_dump_executor()
 
         # ==================== SeparateRayPPOTrainer config ====================
 
