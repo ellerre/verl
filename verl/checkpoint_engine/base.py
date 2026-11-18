@@ -312,6 +312,8 @@ class CheckpointEngineWorker(Worker):
         backend = self.rollout_config.checkpoint_engine.backend
         if backend == "nccl_m2n" and self.rollout_config.name != "vllm":
             raise NotImplementedError("checkpoint_engine.backend='nccl_m2n' currently requires rollout.name='vllm'")
+        if backend == "torchstore" and self.rollout_config.name != "vllm":
+            raise NotImplementedError("checkpoint_engine.backend='torchstore' currently requires rollout.name='vllm'")
         if backend == "nccl_m2n":
             config = self.rollout_config
             if config.pipeline_model_parallel_size != 1:
@@ -335,6 +337,9 @@ class CheckpointEngineWorker(Worker):
             engine_kwargs["destination_shard_size"] = self.rollout_config.tensor_model_parallel_size
             engine_kwargs["destination_expert_parallel_size"] = self.rollout_config.expert_parallel_size
             engine_kwargs["derive_topology"] = True
+        if backend == "torchstore":
+            # The rollout's tensor-parallel size is the destination shard size.
+            engine_kwargs["destination_shard_size"] = self.rollout_config.tensor_model_parallel_size
         # If custom_backend_module is set, import it so plugins can register
         # in CheckpointEngineRegistry before the backend is instantiated.
         import_external_libs(self.rollout_config.checkpoint_engine.custom_backend_module or None)

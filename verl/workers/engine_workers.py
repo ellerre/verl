@@ -764,6 +764,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 return metrics or {}
             if effective_mode == "nccl_m2n":
                 per_tensor_param, _ = self.actor.engine.get_per_tensor_param_nccl_m2n()
+            elif effective_mode == "torchstore":
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param_dtensor()
             else:
                 per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
