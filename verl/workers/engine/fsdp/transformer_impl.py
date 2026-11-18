@@ -927,6 +927,17 @@ class FSDPEngine(BaseEngine):
             raise NotImplementedError("FSDP NCCL M2N export does not support LoRA or QAT")
         return self.get_per_tensor_param_shard(**kwargs)
 
+    def get_per_tensor_param_dtensor(self, **kwargs):
+        """Yield the FSDP2 parameters as DTensors, under their checkpoint names."""
+
+        if self._is_lora or self._qat_enabled:
+            raise NotImplementedError("FSDP DTensor export does not support LoRA or QAT")
+        if fsdp_version(self.module) != 2:
+            raise NotImplementedError("FSDP DTensor export requires FSDP2")
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        return iter(params.items()), None
+
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """Per-param HF delta entry builder: this engine handles DTensor identity
         params only (weight name == HF name, coordinates translate). EP/converter

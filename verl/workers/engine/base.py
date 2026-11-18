@@ -193,6 +193,19 @@ class BaseEngine:
         """
         raise NotImplementedError
 
+    def get_per_tensor_param_dtensor(self, **kwargs) -> tuple[Generator, Optional[dict]]:
+        """Yield final-name parameters as the distributed tensors the engine holds.
+
+        Nothing is gathered, cast or copied: a consumer that understands DTensor
+        layouts (the TorchStore checkpoint backend) reads each rank's local shard
+        and its position in the full tensor from the DTensor itself.
+
+        Returns:
+            Generator: A generator yielding ``(name, DTensor)``.
+            Optional[dict]: Optional PEFT configuration.
+        """
+        raise NotImplementedError
+
     # Host-memory policy for the delta diff base: pinned (cudaHostAlloc) gives a
     # faster H2D on the diff read-back but competes with every other pinned pool
     # on the node; backends whose memory profile makes that competition
