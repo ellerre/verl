@@ -78,3 +78,10 @@ try:
     __all__ += ["NCCLM2NCheckpointEngine"]
 except ImportError:
     NCCLM2NCheckpointEngine = None
+
+try:
+    from .torchstore_checkpoint_engine import TorchStoreCheckpointEngine
+
+    __all__ += ["TorchStoreCheckpointEngine"]
+except ImportError:
+    TorchStoreCheckpointEngine = None
